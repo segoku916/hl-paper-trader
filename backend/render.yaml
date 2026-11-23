@@ -1,0 +1,31 @@
+# Render Blueprint — HL Paper Trader backend (PREP ONLY, Day 1).
+#
+# This file deploys NOTHING by itself. Variou's steps (see RENDER.md):
+#   1. Create a Render account and connect the public hackathon repo.
+#   2. Create a Blueprint / Web Service from this file.
+#   3. Paste GROQ_API_KEY + TELEGRAM_BOT_TOKEN into the Render dashboard
+#      (never in this file, never in git, never in chat).
+#   4. Copy the deployed URL (https://<name>.onrender.com) and add it to
+#      app/app.json's network whitelist, then rebuild the glasses app.
+#
+# Free tier: 750 instance-hours/month, spins down after 15 min idle
+# (first request after sleep takes ~30-60s — acceptable for the demo).
+
+services:
+  - type: web
+    name: hl-paper-trader-backend
+    env: node
+    plan: free
+    buildCommand: npm ci
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      # Secrets — set in the Render dashboard, NOT here.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false

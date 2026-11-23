@@ -1,0 +1,18 @@
+# Dependencies & build output
+node_modules/
+dist/
+*.tgz
+
+# Local env / secrets — NEVER commit
+.env
+.env.local
+.env.*.local
+
+# SQLite paper-ledger databases (local dev + tests)
+*.db
+*.db-journal
+data/
+
+# OS / editor
+.DS_Store
+*.log
