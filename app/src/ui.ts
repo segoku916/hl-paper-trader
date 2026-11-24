@@ -12,11 +12,29 @@ export interface PriceRow {
   change24h: number | null;
 }
 
+export interface PositionView {
+  coin: string;
+  size: number;
+  avgEntry: number;
+  mark: number | null;
+  value: number | null;
+  unrealizedPnl: number | null;
+  unrealizedPnlPct: number | null;
+}
+
+export interface PortfolioView {
+  cash: number;
+  equity: number;
+  realizedPnl: number;
+  positions: PositionView[];
+}
+
 type Status = 'connecting' | 'live' | 'error';
 
 let statusEl: HTMLDivElement;
 let rowsEl: HTMLDivElement;
 let updatedEl: HTMLDivElement;
+let positionsEl: HTMLDivElement;
 
 export function mountUi() {
   const app = document.querySelector<HTMLDivElement>('#app')!;
@@ -28,12 +46,14 @@ export function mountUi() {
       </header>
       <section id="rows" class="rows" aria-live="polite"></section>
       <div id="updated" class="updated"></div>
-      <footer>Tap the glasses temple to refresh · double-tap to exit.</footer>
+      <section id="positions" class="positions" aria-live="polite"></section>
+      <footer>Tap the glasses temple to switch Prices ⇄ Positions · double-tap to exit.</footer>
     </main>
   `;
   statusEl = app.querySelector<HTMLDivElement>('#status')!;
   rowsEl = app.querySelector<HTMLDivElement>('#rows')!;
   updatedEl = app.querySelector<HTMLDivElement>('#updated')!;
+  positionsEl = app.querySelector<HTMLDivElement>('#positions')!;
   injectStyles();
   setPrices([
     { coin: 'BTC', mid: null, change24h: null },
@@ -71,6 +91,45 @@ export function setUpdated(text: string) {
   updatedEl.textContent = text;
 }
 
+/** Day 2 — paper portfolio (positions + PnL) for the web preview panel. */
+export function setPortfolio(p: PortfolioView) {
+  if (!positionsEl) return;
+  const head = `<div class="pos-head">
+      <span>Equity <b>$${formatPrice(p.equity)}</b></span>
+      <span>Cash $${formatPrice(p.cash)}</span>
+      <span>Realized <span class="${p.realizedPnl >= 0 ? 'chg-up' : 'chg-down'}">${formatSigned(p.realizedPnl)}</span></span>
+    </div>`;
+  if (p.positions.length === 0) {
+    positionsEl.innerHTML = `${head}<div class="pos-empty">No open positions</div>`;
+    return;
+  }
+  positionsEl.innerHTML =
+    head +
+    p.positions
+      .map(pos => {
+        const pnl =
+          pos.unrealizedPnl === null
+            ? '<span class="chg chg-flat">—</span>'
+            : `<span class="chg ${pos.unrealizedPnl >= 0 ? 'chg-up' : 'chg-down'}">${formatSigned(pos.unrealizedPnl)} (${pos.unrealizedPnlPct === null ? '—' : formatChange(pos.unrealizedPnlPct)})</span>`;
+        return `<div class="row pos-row">
+          <span class="coin">${pos.coin}</span>
+          <span class="pos-detail">${trimSize(pos.size)} @ $${formatPrice(pos.avgEntry)}<br>
+            <span class="pos-sub">Val ${pos.value === null ? '—' : '$' + formatPrice(pos.value)}</span></span>
+          ${pnl}
+        </div>`;
+      })
+      .join('');
+}
+
+function trimSize(size: number): string {
+  return String(Number(size.toFixed(6)));
+}
+
+export function formatSigned(n: number): string {
+  const sign = n >= 0 ? '+' : '−';
+  return `${sign}$${formatPrice(Math.abs(n))}`;
+}
+
 export function formatPrice(mid: number): string {
   return mid.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
@@ -89,6 +148,29 @@ export function formatGlassesText(prices: PriceRow[]): string {
       return `${row.coin} $${price}${change}`;
     })
     .join('\n');
+}
+
+/** Compact positions + PnL text for the G2 display (576x288 container). */
+export function formatGlassesPositions(p: PortfolioView): string {
+  const lines = [
+    'HL Paper Trader · Positions',
+    `Equity $${formatPrice(p.equity)}`,
+    `Cash $${formatPrice(p.cash)} · Realized ${formatSigned(p.realizedPnl)}`,
+  ];
+  if (p.positions.length === 0) {
+    lines.push('No open positions');
+    return lines.join('\n');
+  }
+  for (const pos of p.positions) {
+    lines.push(`${pos.coin} ${trimSize(pos.size)} @ $${formatPrice(pos.avgEntry)}`);
+    const val = pos.value === null ? '—' : `$${formatPrice(pos.value)}`;
+    const pnl =
+      pos.unrealizedPnl === null
+        ? ''
+        : ` · ${formatSigned(pos.unrealizedPnl)}${pos.unrealizedPnlPct === null ? '' : ` (${formatChange(pos.unrealizedPnlPct)})`}`;
+    lines.push(`Val ${val}${pnl}`);
+  }
+  return lines.join('\n');
 }
 
 function injectStyles() {
@@ -120,6 +202,13 @@ function injectStyles() {
     .chg-down { color: #FF453A; }
     .chg-flat { color: #919191; }
     .updated { font-size: 12px; color: #7B7B7B; text-align: right; min-height: 16px; }
+    .positions { display: flex; flex-direction: column; gap: 12px; }
+    .pos-head { display: flex; gap: 16px; flex-wrap: wrap; font-size: 14px; color: #A7A7A7;
+      background: #2E2E2E; border: 1px solid #3E3E3E; border-radius: 12px; padding: 12px 16px; }
+    .pos-head b { color: #E5E5E5; }
+    .pos-empty { font-size: 14px; color: #7B7B7B; text-align: center; padding: 8px 0; }
+    .pos-detail { flex: 1; font-size: 16px; font-variant-numeric: tabular-nums; }
+    .pos-sub { font-size: 13px; color: #A7A7A7; }
     footer { font-size: 12px; color: #7B7B7B; text-align: center; }
   `;
   const style = document.createElement('style');
