@@ -9,14 +9,19 @@
  *   GET /prices     live BTC/ETH/SOL mids + 24h change (Hyperliquid allMids)
  *   GET /positions  paper portfolio: cash, equity, positions, fills (Day 2)
  *   POST /order     execute a confirmed paper order at the live mid (Day 2)
+ *   POST /stt       transcribe glasses mic PCM via Groq Whisper (Day 3)
+ *   POST /intent    parse a transcript + preview the order, no execution (Day 3)
  *   WS  /stream     live mids + fill notifications pushed to glasses clients
  *
- * Day 3+: POST /stt, POST /alerts (see README.md).
+ * Day 4+: POST /alerts (see README.md).
  */
 import { createServer } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { HyperliquidFeed } from './hl.js';
 import { PaperLedger, LedgerError } from './ledger.js';
+import { parseIntent } from './intent.js';
+import { buildPreview } from './preview.js';
+import { transcribePcm, SttError, STT_BODY_CAP_BYTES, STT_MAX_BYTES } from './stt.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 // Test runs point LEDGER_DB at a temp file so the real paper account (starting
@@ -47,6 +52,25 @@ function readJsonBody(req: import('node:http').IncomingMessage): Promise<unknown
         reject(new LedgerError(400, 'request body must be valid JSON'));
       }
     });
+    req.on('error', () => reject(new LedgerError(400, 'failed to read request body')));
+  });
+}
+
+/** Read a raw audio body (POST /stt). Rejects >2 MB. */
+function readRawBody(req: import('node:http').IncomingMessage): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    req.on('data', (chunk: Buffer) => {
+      size += chunk.length;
+      if (size > STT_BODY_CAP_BYTES) {
+        reject(new LedgerError(413, 'request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', () => reject(new LedgerError(400, 'failed to read request body')));
   });
 }
@@ -82,7 +106,7 @@ const server = createServer((req, res) => {
     sendJson(200, {
       ok: true,
       service: 'hl-paper-trader-backend',
-      version: '0.2.0',
+      version: '0.3.0',
       hlConnected: feed.connected,
     });
     return;
@@ -138,6 +162,52 @@ const server = createServer((req, res) => {
     return;
   }
 
+  if (req.url === '/stt') {
+    if (req.method !== 'POST') {
+      sendJson(405, { ok: false, error: 'method not allowed' });
+      return;
+    }
+    void (async () => {
+      try {
+        const pcm = await readRawBody(req);
+        if (pcm.length === 0) throw new LedgerError(400, 'empty audio — nothing to transcribe');
+        if (pcm.length > STT_MAX_BYTES) {
+          throw new LedgerError(400, 'audio too long — max 30 seconds per voice command');
+        }
+        const startedAt = Date.now();
+        const transcript = await transcribePcm(pcm, process.env.GROQ_API_KEY);
+        sendJson(200, { ok: true, transcript, durationMs: Date.now() - startedAt, model: 'whisper-large-v3-turbo' });
+      } catch (err) {
+        if (err instanceof SttError) sendJson(err.status, { ok: false, error: err.message });
+        else sendError(err);
+      }
+    })();
+    return;
+  }
+
+  if (req.url === '/intent') {
+    if (req.method !== 'POST') {
+      sendJson(405, { ok: false, error: 'method not allowed' });
+      return;
+    }
+    void (async () => {
+      try {
+        const body = (await readJsonBody(req)) as { transcript?: unknown };
+        if (typeof body.transcript !== 'string' || !body.transcript.trim()) {
+          throw new LedgerError(400, 'intent needs {transcript} — e.g. {"transcript":"buy 0.01 BTC"}');
+        }
+        const intent = parseIntent(body.transcript);
+        const marks: Record<string, number | null> = {};
+        for (const p of feed.snapshot()) marks[p.coin] = p.mid;
+        const { preview, alert, error } = buildPreview(intent, marks, ledger.getPortfolio(marks));
+        sendJson(200, { ok: true, transcript: body.transcript.trim(), intent, preview, alert: alert ?? null, error: error ?? null });
+      } catch (err) {
+        sendError(err);
+      }
+    })();
+    return;
+  }
+
   sendJson(404, { ok: false, error: 'not found' });
 });
 
@@ -171,5 +241,5 @@ wss.on('connection', socket => {
 });
 
 server.listen(PORT, () => {
-  console.log(`hl-paper-trader-backend listening on :${PORT} (/health, /prices, /positions, POST /order, /stream)`);
+  console.log(`hl-paper-trader-backend listening on :${PORT} (/health, /prices, /positions, POST /order, POST /stt, POST /intent, /stream)`);
 });
