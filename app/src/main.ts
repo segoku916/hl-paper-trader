@@ -1,12 +1,14 @@
 /**
- * HL Paper Trader — glasses app entry (Day 1).
+ * HL Paper Trader — glasses app entry (Day 1 prices + Day 2 positions).
  *
  * Home screen: live BTC/ETH/SOL mids + 24h change, polled from our backend
  * (GET /prices, Hyperliquid allMids — the sole price source).
+ * Positions screen (Day 2): paper equity/cash/realized PnL + open positions,
+ * polled from GET /positions. Tap switches between the two screens.
  *
  * The mic/STT voice-order flow is Day 3 — `src/asr/stt.ts` stays the
  * template stub until then, and no API key is needed (or shipped) today.
- * Tap refreshes prices; double-tap exits.
+ * Tap switches screens; double-tap exits.
  */
 import {
   waitForEvenAppBridge,
@@ -15,14 +17,16 @@ import {
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk';
-import { mountUi, setStatus, setPrices, setUpdated, formatGlassesText, type PriceRow } from './ui';
+import { mountUi, setStatus, setPrices, setUpdated, setPortfolio, formatGlassesText, formatGlassesPositions, type PriceRow, type PortfolioView } from './ui';
 
 mountUi();
 
-// Backend origin. Local dev: http://localhost:3000. When the backend is
-// deployed (Render, Variou's step), rebuild with VITE_BACKEND_URL set to the
-// deployed origin — and add that origin to app.json's network whitelist.
-const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? 'http://localhost:3000';
+// Backend origin. Deployed backend (Railway, live since 23 Nov 2026):
+// https://hl-paper-trader-production.up.railway.app
+// Local dev against a local backend: rebuild/run with
+// VITE_BACKEND_URL=http://localhost:3000 — and keep localhost in app.json's
+// network whitelist.
+const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? 'https://hl-paper-trader-production.up.railway.app';
 const POLL_MS = 2000;
 
 const bridge = await waitForEvenAppBridge();
@@ -76,6 +80,13 @@ interface PricesResponse {
   prices?: PriceRow[];
 }
 
+interface PositionsResponse extends PortfolioView {
+  ok: boolean;
+}
+
+type View = 'prices' | 'positions';
+let view: View = 'prices';
+
 async function refreshPrices() {
   try {
     const res = await fetch(`${BACKEND_URL}/prices`, { signal: AbortSignal.timeout(5000) });
@@ -96,7 +107,31 @@ async function refreshPrices() {
 }
 
 await refreshPrices();
-window.setInterval(() => void refreshPrices(), POLL_MS);
+window.setInterval(() => void refreshCurrent(), POLL_MS);
+
+async function refreshCurrent() {
+  if (view === 'positions') await refreshPositions();
+  else await refreshPrices();
+}
+
+async function refreshPositions() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/positions`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = (await res.json()) as PositionsResponse;
+    if (!data.ok) throw new Error('bad /positions response');
+    setPortfolio(data);
+    setStatus('live', 'Live · Paper portfolio');
+    setUpdated('Tap to switch to Prices');
+    currentContent = formatGlassesPositions(data);
+    scheduleGlassesRender();
+  } catch (err) {
+    setStatus('error', 'Backend unreachable — retrying');
+    console.warn('Positions refresh failed:', err);
+    currentContent = 'HL Paper Trader · Positions\nPortfolio unavailable\nTap to retry';
+    scheduleGlassesRender();
+  }
+}
 
 let cleanedUp = false;
 function cleanup() {
@@ -122,7 +157,8 @@ function eventTypeOf(envelope?: { eventType?: OsEventTypeList }): OsEventTypeLis
 //     must fire no matter which envelope the event arrives in, so users
 //     can always exit the app. System exit confirmation dialog appears;
 //     SYSTEM_EXIT_EVENT fires on confirm and we clean up there.
-//   • Tap → refresh prices now. Check DOUBLE_CLICK_EVENT before CLICK_EVENT.
+//   • Tap → switch between the Prices and Positions screens (Day 2).
+//     Check DOUBLE_CLICK_EVENT before CLICK_EVENT.
 const unsubscribe = bridge.onEvenHubEvent(event => {
   const sysType = eventTypeOf(event.sysEvent);
   const textType = eventTypeOf(event.textEvent);
@@ -133,7 +169,8 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
   }
 
   if (sysType === OsEventTypeList.CLICK_EVENT || textType === OsEventTypeList.CLICK_EVENT) {
-    void refreshPrices();
+    view = view === 'prices' ? 'positions' : 'prices';
+    void refreshCurrent();
     return;
   }
 
