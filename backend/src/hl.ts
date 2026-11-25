@@ -12,6 +12,26 @@
 const HL_WS_URL = 'wss://api.hyperliquid.xyz/ws';
 const HL_REST_URL = 'https://api.hyperliquid.xyz/info';
 
+/**
+ * TEST-ONLY override: HL_FIXED_MIDS="BTC=60000,ETH=1700,SOL=71" seeds fixed
+ * mids so a local backend can price orders on sandboxed VMs where the live
+ * Hyperliquid WS is unreachable (this VM blocks it). When the var is unset
+ * — including on Railway, which has no such var — behavior is byte-identical
+ * to before: only the live feed supplies mids. When set, the fixed values
+ * are STICKY: live allMids snapshots never overwrite them, so local
+ * verification is deterministic even if the live feed happens to connect.
+ */
+function parseFixedMids(): Record<string, string> {
+  const raw = process.env.HL_FIXED_MIDS;
+  if (!raw) return {};
+  const out: Record<string, string> = {};
+  for (const part of raw.split(',')) {
+    const [coin, price] = part.split('=').map(s => s.trim());
+    if (coin && price && Number(price) > 0) out[coin.toUpperCase()] = String(Number(price));
+  }
+  return out;
+}
+
 export const WATCH_COINS = ['BTC', 'ETH', 'SOL'] as const;
 export type WatchCoin = (typeof WATCH_COINS)[number];
 
@@ -34,6 +54,8 @@ interface Candle {
 export class HyperliquidFeed {
   private ws: WebSocket | null = null;
   private mids: Record<string, string> = {};
+  /** TEST-ONLY fixed mids (HL_FIXED_MIDS) — re-applied over live snapshots. */
+  private fixedMids: Record<string, string> = {};
   private changes: Record<string, number | null> = { BTC: null, ETH: null, SOL: null };
   private listeners = new Set<Listener>();
   private reconnectDelayMs = 1000;
@@ -42,6 +64,15 @@ export class HyperliquidFeed {
   private lastMidAt = 0;
 
   start(): void {
+    // TEST-ONLY: seed fixed mids (see HL_FIXED_MIDS above) before the live
+    // WS connects, so local verification works without the feed.
+    const fixed = parseFixedMids();
+    if (Object.keys(fixed).length > 0) {
+      this.fixedMids = fixed;
+      this.mids = { ...this.mids, ...fixed };
+      this.lastMidAt = Date.now();
+      console.log('[hl] HL_FIXED_MIDS active (test-only):', fixed);
+    }
     this.connectWs();
     void this.refreshChanges();
     // 24h change moves slowly; refresh every 5 minutes.
@@ -102,7 +133,8 @@ export class HyperliquidFeed {
           data?: { mids?: Record<string, string> };
         };
         if (msg.channel === 'allMids' && msg.data?.mids) {
-          this.mids = msg.data.mids;
+          // TEST-ONLY: fixed mids (if any) win over live snapshots.
+          this.mids = { ...msg.data.mids, ...this.fixedMids };
           this.lastMidAt = Date.now();
           this.notify();
         }
