@@ -29,14 +29,39 @@ export interface PortfolioView {
   positions: PositionView[];
 }
 
+/** Day 3 — order preview from POST /intent (what the Confirm screen shows). */
+export interface OrderPreviewView {
+  coin: string;
+  side: 'buy' | 'sell' | 'close';
+  size: number;
+  price: number;
+  notional: number;
+  cashAfter: number;
+  realizedPnl?: number;
+}
+
+/** Day 3 — executed fill from POST /order (what the Fill screen shows). */
+export interface FillView {
+  coin: string;
+  side: 'buy' | 'sell';
+  size: number;
+  price: number;
+  notional: number;
+  realizedPnl: number;
+}
+
+/** Build stamp — bumped every build day so a stale build is visible in screenshots. */
+export const BUILD_STAMP = 'day3-voice · 2026-11-25';
+
 type Status = 'connecting' | 'live' | 'error';
 
 let statusEl: HTMLDivElement;
 let rowsEl: HTMLDivElement;
 let updatedEl: HTMLDivElement;
 let positionsEl: HTMLDivElement;
+let voiceEl: HTMLDivElement;
 
-export function mountUi() {
+export function mountUi(onVoiceTest?: (transcript: string) => void) {
   const app = document.querySelector<HTMLDivElement>('#app')!;
   app.innerHTML = `
     <main class="panel">
@@ -47,19 +72,49 @@ export function mountUi() {
       <section id="rows" class="rows" aria-live="polite"></section>
       <div id="updated" class="updated"></div>
       <section id="positions" class="positions" aria-live="polite"></section>
-      <footer>Tap the glasses temple to switch Prices ⇄ Positions · double-tap to exit.</footer>
+      <section id="voice" class="voice" aria-live="polite"></section>
+      <footer>Build ${BUILD_STAMP} · Tap temple to switch Prices ⇄ Positions · scroll down = voice · double-tap to exit.</footer>
     </main>
   `;
   statusEl = app.querySelector<HTMLDivElement>('#status')!;
   rowsEl = app.querySelector<HTMLDivElement>('#rows')!;
   updatedEl = app.querySelector<HTMLDivElement>('#updated')!;
   positionsEl = app.querySelector<HTMLDivElement>('#positions')!;
+  voiceEl = app.querySelector<HTMLDivElement>('#voice')!;
   injectStyles();
   setPrices([
     { coin: 'BTC', mid: null, change24h: null },
     { coin: 'ETH', mid: null, change24h: null },
     { coin: 'SOL', mid: null, change24h: null },
   ]);
+
+  // DEV ONLY — the simulator cannot produce mic PCM, so the web preview gets
+  // a test input that feeds a transcript into the same pipeline as the mic.
+  // import.meta.env.DEV is false in production builds: never shipped.
+  if (import.meta.env.DEV && onVoiceTest) {
+    const test = document.createElement('section');
+    test.className = 'voice-test';
+    test.innerHTML = `
+      <div class="voice-test-label">DEV ONLY — simulate a voice transcript</div>
+      <div class="voice-test-row">
+        <input id="voice-test-input" type="text" placeholder='e.g. buy 0.01 BTC' autocomplete="off">
+        <button id="voice-test-btn" type="button">Send transcript</button>
+      </div>
+    `;
+    voiceEl.after(test);
+    const input = test.querySelector<HTMLInputElement>('#voice-test-input')!;
+    const btn = test.querySelector<HTMLButtonElement>('#voice-test-btn')!;
+    const send = () => {
+      const text = input.value.trim();
+      if (!text) return;
+      input.value = '';
+      onVoiceTest(text);
+    };
+    btn.addEventListener('click', send);
+    input.addEventListener('keydown', e => {
+      if (e.key === 'Enter') send();
+    });
+  }
 }
 
 export function setStatus(kind: Status, text: string) {
@@ -121,6 +176,17 @@ export function setPortfolio(p: PortfolioView) {
       .join('');
 }
 
+/** Day 3 — voice screen mirror for the web preview panel. Pass null to hide. */
+export function setVoicePanel(html: string | null) {
+  if (!voiceEl) return;
+  voiceEl.innerHTML = html === null ? '' : `<div class="voice-box">${html}</div>`;
+}
+
+/** Day 3 — escape helper for verbatim backend error text in the web panel. */
+export function escapeHtml(text: string): string {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function trimSize(size: number): string {
   return String(Number(size.toFixed(6)));
 }
@@ -148,6 +214,43 @@ export function formatGlassesText(prices: PriceRow[]): string {
       return `${row.coin} $${price}${change}`;
     })
     .join('\n');
+}
+
+/** Day 3 — Listening screen for the G2 display (576x288 container). */
+export function formatGlassesListening(elapsedSec: number): string {
+  return `Listening…\nTap to stop\n${elapsedSec}s`;
+}
+
+/** Day 3 — one-screen order confirm for the G2 display. */
+export function formatGlassesConfirm(p: OrderPreviewView): string {
+  const verb = p.side === 'buy' ? 'BUY' : p.side === 'sell' ? 'SELL' : 'CLOSE';
+  const lines = [
+    `${verb} ${trimSize(p.size)} ${p.coin} @ $${formatPrice(p.price)}`,
+    `≈ $${formatPrice(p.notional)} · Cash after $${formatPrice(p.cashAfter)}`,
+  ];
+  if (p.realizedPnl !== undefined && p.side !== 'buy') {
+    lines.push(`Realized ${formatSigned(p.realizedPnl)}`);
+  }
+  lines.push('Tap = YES · Scroll = NO');
+  return lines.join('\n');
+}
+
+/** Day 3 — fill confirmation for the G2 display. */
+export function formatGlassesFill(f: FillView): string {
+  const verb = f.side === 'buy' ? 'BUY' : 'SELL';
+  const lines = [
+    `FILLED ${verb} ${trimSize(f.size)} ${f.coin}`,
+    `@ $${formatPrice(f.price)} · $${formatPrice(f.notional)}`,
+  ];
+  if (f.side === 'sell' && f.realizedPnl !== 0) {
+    lines.push(`Realized ${formatSigned(f.realizedPnl)}`);
+  }
+  return lines.join('\n');
+}
+
+/** Day 3 — voice error / retry-hint screen: the backend message verbatim. */
+export function formatGlassesVoiceError(message: string): string {
+  return `${message}\nTap to go back`;
 }
 
 /** Compact positions + PnL text for the G2 display (576x288 container). */
@@ -209,6 +312,18 @@ function injectStyles() {
     .pos-empty { font-size: 14px; color: #7B7B7B; text-align: center; padding: 8px 0; }
     .pos-detail { flex: 1; font-size: 16px; font-variant-numeric: tabular-nums; }
     .pos-sub { font-size: 13px; color: #A7A7A7; }
+    .voice { display: flex; flex-direction: column; gap: 12px; }
+    .voice-box { background: #2E2E2E; border: 1px solid #3CFA44; border-radius: 12px;
+      padding: 16px 20px; font-size: 18px; font-weight: 600; line-height: 1.5;
+      white-space: pre-line; font-variant-numeric: tabular-nums; }
+    .voice-test { display: flex; flex-direction: column; gap: 8px; }
+    .voice-test-label { font-size: 12px; color: #7B7B7B; text-transform: uppercase; letter-spacing: 0.04em; }
+    .voice-test-row { display: flex; gap: 8px; }
+    .voice-test input { flex: 1; background: #2E2E2E; border: 1px solid #3E3E3E;
+      border-radius: 8px; color: #E5E5E5; font-size: 15px; padding: 10px 12px; outline: none; }
+    .voice-test input:focus { border-color: #3CFA44; }
+    .voice-test button { background: #3CFA44; color: #111; border: 0; border-radius: 8px;
+      font-size: 14px; font-weight: 700; padding: 10px 16px; cursor: pointer; }
     footer { font-size: 12px; color: #7B7B7B; text-align: center; }
   `;
   const style = document.createElement('style');
