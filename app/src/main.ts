@@ -1,14 +1,17 @@
 /**
- * HL Paper Trader — glasses app entry (Day 1 prices + Day 2 positions).
+ * HL Paper Trader — glasses app entry (Day 1 prices + Day 2 positions + Day 3 voice).
  *
  * Home screen: live BTC/ETH/SOL mids + 24h change, polled from our backend
  * (GET /prices, Hyperliquid allMids — the sole price source).
  * Positions screen (Day 2): paper equity/cash/realized PnL + open positions,
  * polled from GET /positions. Tap switches between the two screens.
  *
- * The mic/STT voice-order flow is Day 3 — `src/asr/stt.ts` stays the
- * template stub until then, and no API key is needed (or shipped) today.
- * Tap switches screens; double-tap exits.
+ * Voice orders (Day 3): scroll DOWN (R1 ring) from Prices or Positions starts
+ * a ≤15 s listen; tap stops early; mic PCM goes to POST /stt (Groq Whisper,
+ * key backend-only), the transcript to POST /intent, then a one-screen
+ * confirm: tap = YES (POST /order), scroll = NO (auto-cancel after 20 s).
+ * Double-tap exits from every screen. There is no long-press event in the
+ * SDK (OsEventTypeList has no such value), so scroll is the voice trigger.
  */
 import {
   waitForEvenAppBridge,
@@ -17,9 +20,31 @@ import {
   TextContainerUpgrade,
   OsEventTypeList,
 } from '@evenrealities/even_hub_sdk';
-import { mountUi, setStatus, setPrices, setUpdated, setPortfolio, formatGlassesText, formatGlassesPositions, type PriceRow, type PortfolioView } from './ui';
+import {
+  mountUi,
+  setStatus,
+  setPrices,
+  setUpdated,
+  setPortfolio,
+  setVoicePanel,
+  escapeHtml,
+  formatGlassesText,
+  formatGlassesPositions,
+  formatGlassesListening,
+  formatGlassesConfirm,
+  formatGlassesFill,
+  formatGlassesVoiceError,
+  BUILD_STAMP,
+  type PriceRow,
+  type PortfolioView,
+  type OrderPreviewView,
+  type FillView,
+} from './ui';
+import { startSttStream, type SttClient } from './asr/stt';
 
-mountUi();
+console.log(`[hl] HL Paper Trader build ${BUILD_STAMP}`);
+
+mountUi(transcript => void handleTranscript(transcript));
 
 // Backend origin. Deployed backend (Railway, live since 23 Nov 2026):
 // https://hl-paper-trader-production.up.railway.app
@@ -28,6 +53,9 @@ mountUi();
 // network whitelist.
 const BACKEND_URL = (import.meta.env.VITE_BACKEND_URL as string | undefined) ?? 'https://hl-paper-trader-production.up.railway.app';
 const POLL_MS = 2000;
+const LISTEN_MAX_MS = 15_000;
+const CONFIRM_TIMEOUT_MS = 20_000;
+const FILL_SHOW_MS = 4_000;
 
 const bridge = await waitForEvenAppBridge();
 
@@ -73,6 +101,13 @@ function scheduleGlassesRender() {
   }, 120); // debounce display writes — BLE render queue is slow
 }
 
+/** Push one screen to both the glasses container and the web preview panel. */
+function showScreen(glassesText: string, webHtml: string | null) {
+  currentContent = glassesText;
+  scheduleGlassesRender();
+  setVoicePanel(webHtml);
+}
+
 interface PricesResponse {
   ok: boolean;
   hlConnected?: boolean;
@@ -84,8 +119,58 @@ interface PositionsResponse extends PortfolioView {
   ok: boolean;
 }
 
+interface IntentResponse {
+  ok: boolean;
+  transcript?: string;
+  preview?: OrderPreviewView | null;
+  alert?: { coin: string; direction: string; price: number } | null;
+  error?: string | null;
+}
+
+interface OrderResponse {
+  ok: boolean;
+  fill?: FillView;
+  error?: string;
+}
+
 type View = 'prices' | 'positions';
 let view: View = 'prices';
+
+// ── Voice state machine (Day 3) ──────────────────────────────────────────
+// idle: normal Prices/Positions polling. Every other mode pauses the 2 s
+// poll so a refresh can never overwrite a voice screen.
+type VoiceMode =
+  | { mode: 'idle' }
+  | { mode: 'listening'; startedAt: number }
+  | { mode: 'thinking'; transcript: string }
+  | { mode: 'confirm'; preview: OrderPreviewView; transcript: string }
+  | { mode: 'info'; message: string }
+  | { mode: 'fill'; fill: FillView }
+  | { mode: 'error'; message: string };
+
+let voice: VoiceMode = { mode: 'idle' };
+let sttClient: SttClient | null = null;
+let voiceTimer: number | null = null; // one-shot (listen cap / confirm timeout / fill return)
+let listenTicker: number | null = null; // 1 s elapsed-seconds refresh while listening
+
+function clearVoiceTimers() {
+  if (voiceTimer !== null) {
+    window.clearTimeout(voiceTimer);
+    voiceTimer = null;
+  }
+  if (listenTicker !== null) {
+    window.clearInterval(listenTicker);
+    listenTicker = null;
+  }
+}
+
+async function stopMicQuietly() {
+  try {
+    await bridge.audioControl(false);
+  } catch (err) {
+    console.warn('audioControl(false) failed:', err);
+  }
+}
 
 async function refreshPrices() {
   try {
@@ -107,7 +192,11 @@ async function refreshPrices() {
 }
 
 await refreshPrices();
-window.setInterval(() => void refreshCurrent(), POLL_MS);
+// Polling pauses while any voice screen is up (listening/confirm/fill/…),
+// so a refresh can never overwrite it; it resumes on return to idle.
+window.setInterval(() => {
+  if (voice.mode === 'idle') void refreshCurrent();
+}, POLL_MS);
 
 async function refreshCurrent() {
   if (view === 'positions') await refreshPositions();
@@ -133,10 +222,168 @@ async function refreshPositions() {
   }
 }
 
+/** Back to the Prices screen: clear voice state, resume polling. */
+function backToPrices() {
+  clearVoiceTimers();
+  sttClient = null;
+  voice = { mode: 'idle' };
+  view = 'prices';
+  setVoicePanel(null);
+  void refreshPrices();
+}
+
+function showVoiceError(message: string) {
+  voice = { mode: 'error', message };
+  showScreen(formatGlassesVoiceError(message), escapeHtml(message));
+  setStatus('error', 'Voice — tap to go back');
+}
+
+function showVoiceInfo(message: string) {
+  voice = { mode: 'info', message };
+  showScreen(formatGlassesVoiceError(message), escapeHtml(message));
+  setStatus('live', 'Voice');
+}
+
+/** Start a ≤15 s listen window (scroll down from Prices/Positions). */
+async function startListening() {
+  if (voice.mode !== 'idle') return;
+  const startedAt = Date.now();
+  voice = { mode: 'listening', startedAt };
+  const renderListening = () => {
+    const elapsed = Math.floor((Date.now() - startedAt) / 1000);
+    showScreen(formatGlassesListening(elapsed), `Listening…<br>Tap to stop · ${elapsed}s`);
+  };
+  renderListening();
+  setStatus('live', 'Listening… tap to stop');
+  listenTicker = window.setInterval(renderListening, 1000);
+  voiceTimer = window.setTimeout(() => void stopListening(), LISTEN_MAX_MS);
+
+  sttClient = startSttStream(
+    BACKEND_URL,
+    snap => {
+      if (snap.finished) void handleTranscript(snap.finalText);
+    },
+    err => {
+      console.warn('STT failed:', err);
+      showVoiceError(err instanceof Error ? err.message : 'Voice transcription failed');
+    },
+  );
+  try {
+    await bridge.audioControl(true);
+  } catch (err) {
+    console.warn('audioControl(true) failed (mic may be unavailable in the simulator):', err);
+  }
+}
+
+/** Stop the mic early (tap) or at the 15 s cap; STT POSTs and the snapshot flows on. */
+async function stopListening() {
+  if (voice.mode !== 'listening') return;
+  clearVoiceTimers();
+  await stopMicQuietly();
+  const client = sttClient;
+  sttClient = null;
+  voice = { mode: 'thinking', transcript: '' };
+  showScreen('Heard…\nChecking…', 'Heard…<br>Checking…');
+  client?.close();
+}
+
+/**
+ * The single transcript pipeline — shared by the real mic path (STT snapshot),
+ * the DEV `?voice=` query param, and the DEV web-preview test input.
+ */
+async function handleTranscript(transcript: string) {
+  const text = transcript.trim();
+  if (!text) {
+    showVoiceError('Didn\'t catch that — try "buy 0.01 BTC"');
+    return;
+  }
+  clearVoiceTimers();
+  voice = { mode: 'thinking', transcript: text };
+  showScreen(`"${text}"\nChecking…`, `“${escapeHtml(text)}”<br>Checking…`);
+  setStatus('live', 'Checking intent…');
+  try {
+    const res = await fetch(`${BACKEND_URL}/intent`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ transcript: text }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = (await res.json().catch(() => ({}))) as IntentResponse;
+    if (!res.ok || !data.ok) {
+      showVoiceError(typeof data.error === 'string' ? data.error : `Intent failed (HTTP ${res.status})`);
+      return;
+    }
+    if (data.preview) {
+      voice = { mode: 'confirm', preview: data.preview, transcript: text };
+      showScreen(formatGlassesConfirm(data.preview), formatGlassesConfirm(data.preview).replace(/\n/g, '<br>'));
+      setStatus('live', 'Confirm on glasses — tap YES, scroll NO');
+      voiceTimer = window.setTimeout(() => {
+        console.log('[hl] confirm timed out after 20 s, cancelling');
+        backToPrices();
+      }, CONFIRM_TIMEOUT_MS);
+      return;
+    }
+    // No preview: alert ("alerts land Day 4"), needs_size, or unknown —
+    // the backend error text is the screen, verbatim. No order is attempted.
+    showVoiceInfo(data.error ?? 'Didn\'t catch that — try "buy 0.01 BTC"');
+  } catch (err) {
+    console.warn('Intent request failed:', err);
+    showVoiceError('Backend unreachable — retrying');
+  }
+}
+
+/** Confirm screen, tap = YES: execute the previewed order. */
+async function executeConfirmedOrder() {
+  if (voice.mode !== 'confirm') return;
+  const { preview } = voice;
+  clearVoiceTimers();
+  voice = { mode: 'thinking', transcript: '' };
+  showScreen('Placing order…', 'Placing order…');
+  try {
+    const res = await fetch(`${BACKEND_URL}/order`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ coin: preview.coin, side: preview.side, size: preview.size }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    const data = (await res.json().catch(() => ({}))) as OrderResponse;
+    if (!res.ok || !data.ok || !data.fill) {
+      showVoiceError(typeof data.error === 'string' ? data.error : `Order failed (HTTP ${res.status})`);
+      return;
+    }
+    voice = { mode: 'fill', fill: data.fill };
+    showScreen(formatGlassesFill(data.fill), formatGlassesFill(data.fill).replace(/\n/g, '<br>'));
+    setStatus('live', 'Order filled');
+    voiceTimer = window.setTimeout(backToPrices, FILL_SHOW_MS);
+  } catch (err) {
+    console.warn('Order request failed:', err);
+    showVoiceError('Backend unreachable — retrying');
+  }
+}
+
+/** Normalize a PCM chunk: the host may deliver Uint8Array, number[], or base64. */
+function normalizePcm(raw: unknown): Uint8Array | null {
+  if (raw instanceof Uint8Array) return raw;
+  if (Array.isArray(raw)) return Uint8Array.from(raw as number[]);
+  if (typeof raw === 'string') {
+    try {
+      const bin = atob(raw);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return out;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
 let cleanedUp = false;
 function cleanup() {
   if (cleanedUp) return;
   cleanedUp = true;
+  clearVoiceTimers();
+  void stopMicQuietly();
   unsubscribe();
 }
 
@@ -155,23 +402,72 @@ function eventTypeOf(envelope?: { eventType?: OsEventTypeList }): OsEventTypeLis
 // Event routing:
 //   • Double-tap → `shutDownPageContainer(1)` is a root-level check: it
 //     must fire no matter which envelope the event arrives in, so users
-//     can always exit the app. System exit confirmation dialog appears;
-//     SYSTEM_EXIT_EVENT fires on confirm and we clean up there.
-//   • Tap → switch between the Prices and Positions screens (Day 2).
-//     Check DOUBLE_CLICK_EVENT before CLICK_EVENT.
+//     can always exit the app — from every screen, including voice screens.
+//     System exit confirmation dialog appears; SYSTEM_EXIT_EVENT fires on
+//     confirm and we clean up there.
+//   • Tap → depends on the voice state: idle toggles Prices ⇄ Positions;
+//     listening stops early (then STT runs); confirm executes the order;
+//     info/error/fill returns to Prices. Ignored while thinking.
+//   • Scroll down (R1 ring) → from idle, starts listening; on the confirm
+//     screen, any scroll cancels the order. Otherwise ignored.
+//   • Mic PCM chunks → fed to the STT buffer while listening.
 const unsubscribe = bridge.onEvenHubEvent(event => {
   const sysType = eventTypeOf(event.sysEvent);
   const textType = eventTypeOf(event.textEvent);
 
   if (sysType === OsEventTypeList.DOUBLE_CLICK_EVENT || textType === OsEventTypeList.DOUBLE_CLICK_EVENT) {
+    void stopMicQuietly();
     bridge.shutDownPageContainer(1);
     return;
   }
 
-  if (sysType === OsEventTypeList.CLICK_EVENT || textType === OsEventTypeList.CLICK_EVENT) {
-    view = view === 'prices' ? 'positions' : 'prices';
-    void refreshCurrent();
+  if (event.audioEvent?.audioPcm && voice.mode === 'listening' && sttClient) {
+    const pcm = normalizePcm(event.audioEvent.audioPcm);
+    if (pcm) sttClient.sendPcm(pcm);
     return;
+  }
+
+  const isClick = sysType === OsEventTypeList.CLICK_EVENT || textType === OsEventTypeList.CLICK_EVENT;
+  const isScrollDown =
+    sysType === OsEventTypeList.SCROLL_BOTTOM_EVENT || textType === OsEventTypeList.SCROLL_BOTTOM_EVENT;
+  const isScroll =
+    isScrollDown ||
+    sysType === OsEventTypeList.SCROLL_TOP_EVENT ||
+    textType === OsEventTypeList.SCROLL_TOP_EVENT;
+
+  if (isClick) {
+    switch (voice.mode) {
+      case 'idle':
+        view = view === 'prices' ? 'positions' : 'prices';
+        void refreshCurrent();
+        break;
+      case 'listening':
+        void stopListening();
+        break;
+      case 'confirm':
+        void executeConfirmedOrder();
+        break;
+      case 'info':
+      case 'error':
+      case 'fill':
+        backToPrices();
+        break;
+      case 'thinking':
+        break; // ignore taps while STT/intent/order is in flight
+    }
+    return;
+  }
+
+  if (isScroll) {
+    if (voice.mode === 'confirm') {
+      console.log('[hl] confirm cancelled by scroll');
+      backToPrices();
+      return;
+    }
+    if (isScrollDown && voice.mode === 'idle') {
+      void startListening();
+      return;
+    }
   }
 
   if (sysType === OsEventTypeList.SYSTEM_EXIT_EVENT || sysType === OsEventTypeList.ABNORMAL_EXIT_EVENT) {
@@ -180,3 +476,14 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
 });
 
 window.addEventListener('beforeunload', cleanup);
+
+// DEV ONLY — the simulator cannot produce mic PCM, so `?voice=<transcript>`
+// feeds a transcript into the SAME handleTranscript → /intent → Confirm →
+// /order pipeline as the real mic path. import.meta.env.DEV is false in
+// production builds: never active in a shipped app.
+if (import.meta.env.DEV) {
+  const voiceParam = new URLSearchParams(window.location.search).get('voice');
+  if (voiceParam) {
+    window.setTimeout(() => void handleTranscript(voiceParam), 500);
+  }
+}
