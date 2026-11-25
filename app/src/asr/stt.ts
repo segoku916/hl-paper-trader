@@ -1,27 +1,15 @@
-// Speech-to-text client for the G2 microphone.
+// Speech-to-text client for the G2 microphone (Day 3).
 //
 // The G2 mic emits PCM s16le @ 16 kHz, mono via `bridge.audioControl(true)`.
 // Each onEvenHubEvent callback with `audioEvent.audioPcm` delivers a chunk.
 //
-// ─────────────────────────────────────────────────────────────────────
-// choose your own implementation here
-// ─────────────────────────────────────────────────────────────────────
-// Pick whichever STT provider you prefer — streaming or batch, hosted
-// or self-hosted — and implement the three functions below. The rest
-// of the scaffold (main.ts, ui.ts) already wires the mic into
-// `sendPcm` and renders whatever `onSnapshot` emits.
+// Buffer-and-POST client (no streaming STT in v1): `sendPcm` appends chunks
+// to an in-memory buffer (capped at ~15 s ≈ 480 KB); `close()` POSTs the
+// buffer to `<backend>/stt` and emits the transcript as one final snapshot
+// (`finalText`, `finished:true`). Errors go to `onError`.
 //
-// Treat each snapshot as a full transcript state, not a delta:
-//   - finalText: text the provider is confident about
-//   - interimText: unstable tail that may still change
-//   - finished: true on the terminal message, after which no more
-//     snapshots will be emitted
-//
-// Don't forget to add a `network` permission to app.json with your
-// provider's hosts in the `whitelist` array once you wire this up.
-// `evenhub pack` rejects an empty whitelist, which is why the default
-// app.json omits the `network` entry entirely.
-// ─────────────────────────────────────────────────────────────────────
+// The Groq API key lives ONLY in the backend — this client never sees a key.
+// The first constructor arg is the backend URL, not an API key.
 
 export interface SttSnapshot {
   finalText: string
@@ -34,12 +22,62 @@ export interface SttClient {
   close(): void
 }
 
+/** 15 s of 16 kHz s16le mono PCM = 15 * 16000 * 2 bytes. */
+export const STT_MAX_BUFFER_BYTES = 480_000
+
+interface SttResponse {
+  ok?: boolean
+  transcript?: string
+  error?: string
+}
+
 export function startSttStream(
-  _apiKey: string,
-  _onSnapshot: (snap: SttSnapshot) => void,
-  _onError?: (err: unknown) => void,
+  backendUrl: string,
+  onSnapshot: (snap: SttSnapshot) => void,
+  onError?: (err: unknown) => void,
 ): SttClient {
-  throw new Error(
-    'STT provider not implemented — open src/asr/stt.ts and wire up your chosen STT service.',
-  )
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+  let closed = false
+
+  return {
+    sendPcm(chunk: Uint8Array): void {
+      if (closed) return
+      if (totalBytes >= STT_MAX_BUFFER_BYTES) return // cap: drop the tail past 15 s
+      const room = STT_MAX_BUFFER_BYTES - totalBytes
+      const kept = chunk.length > room ? chunk.subarray(0, room) : chunk
+      chunks.push(kept)
+      totalBytes += kept.length
+    },
+
+    close(): void {
+      if (closed) return
+      closed = true
+      void (async () => {
+        try {
+          const pcm = new Uint8Array(totalBytes)
+          let offset = 0
+          for (const chunk of chunks) {
+            pcm.set(chunk, offset)
+            offset += chunk.length
+          }
+          const res = await fetch(`${backendUrl}/stt`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/octet-stream' },
+            body: pcm,
+            signal: AbortSignal.timeout(30_000),
+          })
+          const data = (await res.json().catch(() => ({}))) as SttResponse
+          if (!res.ok || !data.ok) {
+            throw new Error(
+              typeof data.error === 'string' ? data.error : `STT failed (HTTP ${res.status})`,
+            )
+          }
+          onSnapshot({ finalText: data.transcript ?? '', interimText: '', finished: true })
+        } catch (err) {
+          onError?.(err)
+        }
+      })()
+    },
+  }
 }
