@@ -338,6 +338,13 @@ export function createTelegramBot(deps: TelegramDeps): TelegramHandle | null {
 
   bot.command('price', async ctx => {
     const arg = ctx.match?.toString().trim().toUpperCase() ?? '';
+    // Day 5 honesty: while the feed is disconnected the snapshot holds
+    // last-known mids, not live ones — say so instead of answering with a
+    // dead number presented as live.
+    if (!feed.connected) {
+      await ctx.reply('Live prices unavailable — Hyperliquid feed reconnecting, retry in a moment');
+      return;
+    }
     const snapshot = feed.snapshot();
     if (!arg) {
       const lines = snapshot.map(p => {
