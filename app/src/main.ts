@@ -12,6 +12,10 @@
  * confirm: tap = YES (POST /order), scroll = NO (auto-cancel after 20 s).
  * Double-tap exits from every screen. There is no long-press event in the
  * SDK (OsEventTypeList has no such value), so scroll is the voice trigger.
+ *
+ * Day 4: voice alerts are stored for real (POST /intent sets the alert and
+ * the glasses confirm it); order confirms carry the backend's pending-order
+ * id so a Telegram inline Yes and a glasses tap can never double-execute.
  */
 import {
   waitForEvenAppBridge,
@@ -124,6 +128,11 @@ interface IntentResponse {
   transcript?: string;
   preview?: OrderPreviewView | null;
   alert?: { coin: string; direction: string; price: number } | null;
+  alertId?: number | null;
+  /** Day 4: "Alert set: …" confirmation text for a stored alert. */
+  message?: string | null;
+  /** Day 4: id of the pending order both confirm paths share. */
+  pendingOrderId?: string | null;
   error?: string | null;
 }
 
@@ -143,7 +152,7 @@ type VoiceMode =
   | { mode: 'idle' }
   | { mode: 'listening'; startedAt: number }
   | { mode: 'thinking'; transcript: string }
-  | { mode: 'confirm'; preview: OrderPreviewView; transcript: string }
+  | { mode: 'confirm'; preview: OrderPreviewView; transcript: string; pendingOrderId: string | null }
   | { mode: 'info'; message: string }
   | { mode: 'fill'; fill: FillView }
   | { mode: 'error'; message: string };
@@ -314,17 +323,27 @@ async function handleTranscript(transcript: string) {
       return;
     }
     if (data.preview) {
-      voice = { mode: 'confirm', preview: data.preview, transcript: text };
+      voice = { mode: 'confirm', preview: data.preview, transcript: text, pendingOrderId: data.pendingOrderId ?? null };
       showScreen(formatGlassesConfirm(data.preview), formatGlassesConfirm(data.preview).replace(/\n/g, '<br>'));
       setStatus('live', 'Confirm on glasses — tap YES, scroll NO');
       voiceTimer = window.setTimeout(() => {
         console.log('[hl] confirm timed out after 20 s, cancelling');
+        cancelPendingOrder();
         backToPrices();
       }, CONFIRM_TIMEOUT_MS);
       return;
     }
-    // No preview: alert ("alerts land Day 4"), needs_size, or unknown —
-    // the backend error text is the screen, verbatim. No order is attempted.
+    // Day 4: a voice alert is stored for real — the backend confirms it was
+    // SET (the Day 3 "alerts land on Day 4" text is gone). Tap to go back.
+    if (data.alert) {
+      showVoiceInfo(
+        data.message ??
+          `Alert set: ${data.alert.coin} ${data.alert.direction} $${data.alert.price.toLocaleString('en-US')}`,
+      );
+      return;
+    }
+    // No preview and no alert: needs_size or unknown — the backend error
+    // text is the screen, verbatim. No order is attempted.
     showVoiceInfo(data.error ?? 'Didn\'t catch that — try "buy 0.01 BTC"');
   } catch (err) {
     console.warn('Intent request failed:', err);
@@ -332,18 +351,36 @@ async function handleTranscript(transcript: string) {
   }
 }
 
+/** Day 4: tell the backend the shared pending order is cancelled (scroll-No
+ * or the 20 s timeout) so a Telegram Yes can no longer execute it either.
+ * Best-effort — the glasses return to Prices whether or not the call lands. */
+function cancelPendingOrder() {
+  if (voice.mode !== 'confirm' || !voice.pendingOrderId) return;
+  const pendingOrderId = voice.pendingOrderId;
+  void fetch(`${BACKEND_URL}/order/cancel`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ pendingOrderId }),
+    signal: AbortSignal.timeout(5000),
+  }).catch(err => console.warn('Cancel request failed:', err));
+}
+
 /** Confirm screen, tap = YES: execute the previewed order. */
 async function executeConfirmedOrder() {
   if (voice.mode !== 'confirm') return;
-  const { preview } = voice;
+  const { preview, pendingOrderId } = voice;
   clearVoiceTimers();
   voice = { mode: 'thinking', transcript: '' };
   showScreen('Placing order…', 'Placing order…');
   try {
+    // Day 4: send the pending-order id so the backend claims the ONE shared
+    // order — a Telegram Yes that already filled it makes this a no-op.
+    const body: Record<string, unknown> = { coin: preview.coin, side: preview.side, size: preview.size };
+    if (pendingOrderId) body.pendingOrderId = pendingOrderId;
     const res = await fetch(`${BACKEND_URL}/order`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ coin: preview.coin, side: preview.side, size: preview.size }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(10_000),
     });
     const data = (await res.json().catch(() => ({}))) as OrderResponse;
@@ -464,6 +501,7 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
   if (isScroll) {
     if (voice.mode === 'confirm') {
       console.log('[hl] confirm cancelled by scroll');
+      cancelPendingOrder();
       backToPrices();
       return;
     }
