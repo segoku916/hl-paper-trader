@@ -42,7 +42,9 @@ export function buildPreview(
     return { preview: null, error: `How much ${intent.coin}? Try "buy 0.01 ${intent.coin}"` };
   }
   if (intent.kind === 'alert') {
-    return { preview: null, alert: intent, error: 'Price alerts land on Day 4 — this one is noted, not set yet' };
+    // Day 4: alerts are real now — server.ts stores the alert and returns a
+    // "set" confirmation. No error, no preview; nothing to price here.
+    return { preview: null, alert: intent };
   }
 
   const mid = marks[intent.coin] ?? null;
