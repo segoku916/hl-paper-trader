@@ -12,6 +12,9 @@
  *   fills     — every executed order: coin, side, size, price, notional,
  *               realizedPnl (0 for buys; size*(price-avgEntry) for sells)
  *   meta      — single-row cash balance, key 'cash'
+ *   alerts    — Day 4: voice-set price alerts (coin, direction, price,
+ *               chat id to ping, fired flag). Fire once, then marked fired.
+ *   pairing   — Day 4: single-row Telegram pairing (chat id + code).
  *
  * NOTE (demo): on Render's free tier the SQLite file lives on ephemeral disk,
  * so a redeploy/restart resets the paper account to $10,000. That is fine for
@@ -56,6 +59,27 @@ export interface PortfolioView {
   fills: Fill[];
 }
 
+/** Day 4 — a voice-set price alert. `chatId` is the paired Telegram chat at
+ * creation time (null when nothing was paired yet — the alert still stores
+ * and fires to the paired chat once pairing exists). */
+export interface Alert {
+  id: number;
+  coin: WatchCoin;
+  direction: 'above' | 'below';
+  price: number;
+  chatId: number | null;
+  createdAt: string;
+  fired: boolean;
+  firedAt: string | null;
+}
+
+/** Day 4 — the single paired Telegram chat (one user, one chat). */
+export interface Pairing {
+  chatId: number;
+  code: string;
+  pairedAt: string;
+}
+
 export class LedgerError extends Error {
   readonly status: number;
   constructor(status: number, message: string) {
@@ -93,6 +117,22 @@ export class PaperLedger {
       CREATE TABLE IF NOT EXISTS meta (
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS alerts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        coin TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        price REAL NOT NULL,
+        chatId INTEGER,
+        createdAt INTEGER NOT NULL,
+        fired INTEGER NOT NULL DEFAULT 0,
+        firedAt INTEGER
+      );
+      CREATE TABLE IF NOT EXISTS pairing (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        chatId INTEGER NOT NULL,
+        code TEXT NOT NULL,
+        pairedAt INTEGER NOT NULL
       );
     `);
     this.db
@@ -252,5 +292,108 @@ export class PaperLedger {
       createdAt: new Date(f.createdAt).toISOString(),
     }));
     return { cash, equity: roundMoney(cash + positionsValue), realizedPnl, positions, fills };
+  }
+
+  // ── Day 4: price alerts ──────────────────────────────────────────────
+
+  /** Store a voice-set price alert. Throws LedgerError(400) on bad input. */
+  createAlert(
+    coin: string,
+    direction: string,
+    price: unknown,
+    chatId: number | null,
+  ): Alert {
+    if (!(WATCH_COINS as readonly string[]).includes(coin)) {
+      throw new LedgerError(400, `unknown coin: ${coin} (alerts: BTC, ETH, SOL)`);
+    }
+    if (direction !== 'above' && direction !== 'below') {
+      throw new LedgerError(400, `unknown direction: ${direction} (above, below)`);
+    }
+    if (typeof price !== 'number' || !Number.isFinite(price) || price <= 0) {
+      throw new LedgerError(400, `alert price must be a positive number (got ${JSON.stringify(price)})`);
+    }
+    const now = Date.now();
+    const result = this.db
+      .prepare(
+        `INSERT INTO alerts (coin, direction, price, chatId, createdAt, fired)
+         VALUES (?, ?, ?, ?, ?, 0)`,
+      )
+      .run(coin, direction, price, chatId, now);
+    return {
+      id: Number(result.lastInsertRowid),
+      coin: coin as WatchCoin,
+      direction: direction as 'above' | 'below',
+      price,
+      chatId,
+      createdAt: new Date(now).toISOString(),
+      fired: false,
+      firedAt: null,
+    };
+  }
+
+  /** All alerts, newest first. */
+  listAlerts(limit = 50): Alert[] {
+    const rows = this.db
+      .prepare(
+        `SELECT id, coin, direction, price, chatId, createdAt, fired, firedAt
+         FROM alerts ORDER BY id DESC LIMIT ?`,
+      )
+      .all(limit) as {
+      id: number;
+      coin: string;
+      direction: string;
+      price: number;
+      chatId: number | null;
+      createdAt: number;
+      fired: number;
+      firedAt: number | null;
+    }[];
+    return rows.map(r => ({
+      id: r.id,
+      coin: r.coin as WatchCoin,
+      direction: r.direction as 'above' | 'below',
+      price: r.price,
+      chatId: r.chatId,
+      createdAt: new Date(r.createdAt).toISOString(),
+      fired: r.fired === 1,
+      firedAt: r.firedAt === null ? null : new Date(r.firedAt).toISOString(),
+    }));
+  }
+
+  /** Alerts that have not fired yet, oldest first (the checker evaluates these). */
+  listUnfiredAlerts(): Alert[] {
+    return this.listAlerts(1000).filter(a => !a.fired).reverse();
+  }
+
+  /**
+   * Mark an alert fired — the dedup guard. The UPDATE only flips rows that
+   * are still unfired, so even if two checker ticks race on a hovering
+   * price, exactly one of them observes `true` and sends the ping.
+   */
+  markAlertFired(id: number): boolean {
+    const result = this.db
+      .prepare(`UPDATE alerts SET fired = 1, firedAt = ? WHERE id = ? AND fired = 0`)
+      .run(Date.now(), id);
+    return result.changes === 1;
+  }
+
+  // ── Day 4: Telegram pairing (single row) ─────────────────────────────
+
+  /** Pair (or re-pair) a Telegram chat id. One user, one chat. */
+  pairChat(chatId: number, code: string): void {
+    this.db
+      .prepare(
+        `INSERT INTO pairing (id, chatId, code, pairedAt) VALUES (1, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET chatId = excluded.chatId, code = excluded.code, pairedAt = excluded.pairedAt`,
+      )
+      .run(chatId, code, Date.now());
+  }
+
+  getPairing(): Pairing | null {
+    const row = this.db.prepare(`SELECT chatId, code, pairedAt FROM pairing WHERE id = 1`).get() as
+      | { chatId: number; code: string; pairedAt: number }
+      | undefined;
+    if (!row) return null;
+    return { chatId: row.chatId, code: row.code, pairedAt: new Date(row.pairedAt).toISOString() };
   }
 }
