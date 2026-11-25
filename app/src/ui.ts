@@ -51,7 +51,7 @@ export interface FillView {
 }
 
 /** Build stamp — bumped every build day so a stale build is visible in screenshots. */
-export const BUILD_STAMP = 'day3-voice · 2026-11-25';
+export const BUILD_STAMP = 'day4-telegram · 2026-11-25';
 
 type Status = 'connecting' | 'live' | 'error';
 
