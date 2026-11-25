@@ -5,7 +5,7 @@
  * only to this server. Paper trading only; no wallet, no signing, no real funds.
  *
  * Endpoints:
- *   GET /health     liveness probe (version 0.4.0, Telegram status)
+ *   GET /health     liveness probe (version 0.4.1, Telegram status)
  *   GET /prices     live BTC/ETH/SOL mids + 24h change (Hyperliquid allMids)
  *   GET /positions  paper portfolio: cash, equity, positions, fills (Day 2)
  *   POST /order     execute a confirmed paper order at the live mid (Day 2);
@@ -26,6 +26,11 @@
  * and a Telegram inline Yes claim the same order, so one order executes
  * at most once. A 5 s timer evaluates stored price alerts against live
  * mids and fires each once to the paired Telegram chat.
+ *
+ * Day 5 (0.4.1): Telegram /price is honest about a disconnected feed (it
+ * says "reconnecting" instead of quoting last-known mids as live). The
+ * remaining Day 5 edge cases (no-mic state, STT-failure screen, stale
+ * marker, alert popup) live in the glasses app — see app/src/main.ts.
  */
 import { createServer } from 'node:http';
 import { WebSocketServer, WebSocket } from 'ws';
@@ -211,7 +216,7 @@ const server = createServer((req, res) => {
     sendJson(200, {
       ok: true,
       service: 'hl-paper-trader-backend',
-      version: '0.4.0',
+      version: '0.4.1',
       hlConnected: feed.connected,
       telegram: telegram === null ? 'unavailable' : telegram.isPaired() ? 'paired' : 'unpaired',
     });
