@@ -1,56 +1,69 @@
-# asr
+# HL Paper Trader — glasses app
 
-Live speech-to-text demo on G2. Mic audio → your chosen STT provider → transcript rendered on the glasses and mirrored in the companion WebView. Includes double-tap-to-exit wiring.
+The Even G2 front end for **HL Paper Trader** (see the repo-root README
+for the full story). It shows live Hyperliquid BTC/ETH/SOL mids, the paper
+portfolio, and the voice-order flow. It holds **no API keys** and talks
+only to our own backend.
 
-**The STT client itself is a blank stub.** This template has zero vendor code baked in. You pick your own provider (Deepgram, AssemblyAI, Whisper, Soniox, self-hosted, etc.) and wire it up in `src/asr/stt.ts`.
+Derived from the Even Hub `asr` template (startup container, event
+routing, double-tap exit, and the `SttClient` interface in
+`src/asr/stt.ts`); every screen and the whole voice state machine were
+written for this hackathon, 23–26 Nov 2026.
+
+## Controls
+
+| Input | Action |
+|---|---|
+| Tap (temple) | Switch Prices ⇄ Positions · on Confirm: **YES** · stop listening early · dismiss info/error/alert screens |
+| Scroll down (R1 ring) | From Prices/Positions: start listening (≤15 s) · on Confirm: **NO** (cancels on both surfaces) |
+| Double-tap | Exit (system confirmation) |
+
+There is no long-press event in the SDK, so scroll-down is the voice
+trigger.
+
+## Screens & states
+
+- **Prices** — BTC/ETH/SOL mids + 24h change, polled every 2 s. While the
+  feed is down they carry a **STALE · reconnecting — last known** marker;
+  while the backend is down, an explicit "Prices unavailable" state.
+- **Positions** — equity / cash / realized PnL + open positions; an
+  explicit "No open positions — paper equity $X" empty state.
+- **Listening** — elapsed-seconds counter; tap stops early.
+- **Confirm** — one screen: order, notional, cash after. Auto-cancels
+  after 20 s (which also cancels the Telegram confirm — one shared
+  pending order, executable at most once).
+- **Fill** — executed order at the live mid; returns to Prices after 4 s.
+- **Alert fired** — a stored price alert that crossed pops up once
+  (polled from the backend), auto-dismisses after 8 s.
+- **Mic unavailable** — no audio received (mic denied/unavailable):
+  named state, prices keep working.
+- **Voice error** — STT failure or unparseable phrase: "Couldn't hear
+  that — try again" / the backend's message verbatim. No phantom orders.
 
 ## Run
 
 ```bash
-cp .env.example .env.local   # paste your STT provider's API key into VITE_STT_API_KEY
 npm install
-npm run dev
+npm run dev        # Vite on :5173
+npm run build      # tsc --noEmit + vite build -> dist/
+npm run simulate   # desktop simulator (WebKitGTK libs + Xvfb on Linux)
+npx evenhub pack app.json dist -o hl-paper-trader.ehpk --sdk-ver 0.0.10
 ```
 
-Then `npm run simulate` (desktop simulator) or `npx evenhub qr --url http://<your-ip>:5173` to test on real glasses.
+The backend origin is `VITE_BACKEND_URL` at build/dev time, defaulting
+to the deployed Railway backend; it must be whitelisted in `app.json`
+(the manifest already lists the Railway origin + `localhost:3000`).
 
-## First-run expectation
+In dev builds only (`import.meta.env.DEV`), two test hooks exist: a
+`?voice=<transcript>` URL param and a web-preview transcript input, both
+feeding the same `/intent` pipeline as the real mic — the simulator
+cannot produce mic PCM. Production builds contain neither hook.
 
-Until you implement `src/asr/stt.ts`, the companion WebView shows a red error chip: *"STT provider not implemented — open src/asr/stt.ts and wire up your chosen STT service."* That's by design — the scaffold compiles and runs, but the STT handoff throws on startup so you know exactly where to go.
-
-## What's in here
+## Files
 
 | File | Purpose |
 |---|---|
-| `src/main.ts` | App entry. Creates the transcript container, starts the mic, routes PCM chunks to `stt.ts`, renders snapshots with a 120ms debounce, handles double-tap exit. |
-| `src/asr/stt.ts` | **Blank stub.** Provider-agnostic `SttClient` interface + `startSttStream()` function. Implement your STT provider here. |
-| `src/ui.ts` | Companion-app UI — status chip, live transcript mirror, dark theme. |
-| `index.html` | WebView host with zoom-locked viewport. |
-| `app.json` | Manifest with `g2-microphone` permission. **No `network` permission by default** — add yours when you pick a provider. |
-| `.env.example` | `VITE_STT_API_KEY=` placeholder for your provider's key. |
-
-## Wiring your STT provider
-
-1. Open `src/asr/stt.ts`. Replace the `throw` inside `startSttStream` with your provider's logic:
-   - Connect to the provider (WebSocket for streaming, HTTP for batch).
-   - Send the authentication / session-start message.
-   - On each inbound transcript message, build a `SttSnapshot { finalText, interimText, finished }` and call `onSnapshot()`.
-   - Implement `sendPcm(chunk)` to forward each mic chunk. The input is PCM s16le @ 16 kHz, mono — most providers accept this directly; resample if yours doesn't.
-   - Implement `close()` to signal end-of-stream.
-
-2. Paste your API key into `.env.local` as `VITE_STT_API_KEY=...`.
-
-3. Add a `network` permission to `app.json` with your provider's hosts:
-
-   ```json
-   { "name": "network", "desc": "Stream audio to STT.", "whitelist": ["https://api.yourprovider.com", "wss://stream.yourprovider.com"] }
-   ```
-
-   `evenhub pack` rejects an empty whitelist, which is why this entry isn't in `app.json` by default.
-
-## G2 specifics
-
-- Mic format: PCM s16le, 16 kHz, mono. Delivered via `event.audioEvent.audioPcm` as `Uint8Array`.
-- Glasses render is debounced to 120 ms — the BLE queue can't keep up with per-token writes.
-- Transcript is trimmed to the last 240 characters to fit the 576x288 text container at default font.
-- **Double-tap the temple** → `shutDownPageContainer(1)` → system exit confirmation dialog.
+| `src/main.ts` | App entry: screens, polling, voice state machine, event routing, alert polling. |
+| `src/ui.ts` | WebView mirror UI + every glasses text formatter (prices, positions, confirm, fill, edge-case states). |
+| `src/asr/stt.ts` | Buffer-and-POST STT client: mic PCM (s16le, 16 kHz, mono, ≤15 s) → backend `/stt` → one final transcript snapshot. The Groq key lives only in the backend. |
+| `app.json` | Manifest: `g2-microphone` + `network` (backend origins only), version aligned with the backend (0.4.1). |
