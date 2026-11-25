@@ -16,6 +16,13 @@
  * Day 4: voice alerts are stored for real (POST /intent sets the alert and
  * the glasses confirm it); order confirms carry the backend's pending-order
  * id so a Telegram inline Yes and a glasses tap can never double-execute.
+ *
+ * Day 5 (polish): named edge-case states instead of silent fallbacks —
+ * no-mic screen (zero PCM bytes or mic start failure), STT-failure screen
+ * ("Couldn't hear that — try again"), a STALE marker on last-known prices
+ * while the feed reconnects, an explicit empty-positions line, and fired
+ * price alerts surfaced on the glasses too (polled from GET /alerts,
+ * shown once each, never interrupting a Confirm screen).
  */
 import {
   waitForEvenAppBridge,
@@ -38,6 +45,8 @@ import {
   formatGlassesConfirm,
   formatGlassesFill,
   formatGlassesVoiceError,
+  formatGlassesMicUnavailable,
+  formatGlassesAlert,
   BUILD_STAMP,
   type PriceRow,
   type PortfolioView,
@@ -159,6 +168,14 @@ type VoiceMode =
 
 let voice: VoiceMode = { mode: 'idle' };
 let sttClient: SttClient | null = null;
+/** Day 5: PCM bytes heard in the current listen window. Zero at stop time
+ * means the mic never delivered (denied/unavailable) — a named state, not
+ * an STT failure. */
+let micBytesReceived = 0;
+/** Day 5: newest fired-alert id already shown on the glasses (null until
+ * the first /alerts poll baselines it, so history never pops up). */
+let lastFiredAlertId: number | null = null;
+const ALERT_SHOW_MS = 8_000;
 let voiceTimer: number | null = null; // one-shot (listen cap / confirm timeout / fill return)
 let listenTicker: number | null = null; // 1 s elapsed-seconds refresh while listening
 
@@ -188,9 +205,14 @@ async function refreshPrices() {
     const data = (await res.json()) as PricesResponse;
     if (!data.ok || !data.prices) throw new Error('bad /prices response');
     setPrices(data.prices);
-    setStatus('live', data.hlConnected === false ? 'Live · HL reconnecting' : 'Live · Hyperliquid');
+    // Day 5: last-known mids must never pose as live. The feed reports
+    // itself disconnected, or its newest mid is >30 s old → STALE marker.
+    const stale =
+      data.hlConnected === false ||
+      (data.updatedAt !== undefined && Date.now() - new Date(data.updatedAt).getTime() > 30_000);
+    setStatus('live', stale ? 'Stale · HL reconnecting — last known' : 'Live · Hyperliquid');
     setUpdated(data.updatedAt ? `Updated ${new Date(data.updatedAt).toLocaleTimeString()}` : '');
-    currentContent = `HL Paper Trader\n${formatGlassesText(data.prices)}`;
+    currentContent = `HL Paper Trader\n${stale ? 'STALE · reconnecting — last known\n' : ''}${formatGlassesText(data.prices)}`;
     scheduleGlassesRender();
   } catch (err) {
     setStatus('error', 'Backend unreachable — retrying');
@@ -210,6 +232,54 @@ window.setInterval(() => {
 async function refreshCurrent() {
   if (view === 'positions') await refreshPositions();
   else await refreshPrices();
+  await checkFiredAlerts();
+}
+
+interface AlertView {
+  id: number;
+  coin: string;
+  direction: string;
+  price: number;
+  fired: boolean;
+  firedAt: string | null;
+}
+
+interface AlertsResponse {
+  ok: boolean;
+  alerts?: AlertView[];
+}
+
+/**
+ * Day 5: surface fired price alerts on the glasses too (they already ping
+ * Telegram). Runs only from the idle poll, so it can never interrupt a
+ * Confirm screen; an alert that fires mid-confirm is picked up on the
+ * next idle poll instead. Each alert id is shown exactly once; the first
+ * poll baselines the newest fired id so old alerts never pop up.
+ */
+async function checkFiredAlerts() {
+  try {
+    const res = await fetch(`${BACKEND_URL}/alerts`, { signal: AbortSignal.timeout(5000) });
+    if (!res.ok) return;
+    const data = (await res.json()) as AlertsResponse;
+    if (!data.ok || !data.alerts) return;
+    const fired = data.alerts.filter(a => a.fired);
+    if (lastFiredAlertId === null) {
+      lastFiredAlertId = fired.reduce((max, a) => Math.max(max, a.id), 0);
+      return;
+    }
+    const fresh = fired.filter(a => a.id > (lastFiredAlertId as number));
+    if (fresh.length === 0 || voice.mode !== 'idle') return;
+    const newest = fresh.reduce((a, b) => (a.id > b.id ? a : b));
+    lastFiredAlertId = fresh.reduce((max, a) => Math.max(max, a.id), lastFiredAlertId);
+    voice = { mode: 'info', message: `alert ${newest.id}` };
+    showScreen(formatGlassesAlert(newest), formatGlassesAlert(newest).replace(/\n/g, '<br>'));
+    setStatus('live', 'Price alert fired');
+    voiceTimer = window.setTimeout(() => {
+      if (voice.mode === 'info') backToPrices();
+    }, ALERT_SHOW_MS);
+  } catch {
+    // Alerts are best-effort on the glasses; prices keep polling.
+  }
 }
 
 async function refreshPositions() {
@@ -247,6 +317,16 @@ function showVoiceError(message: string) {
   setStatus('error', 'Voice — tap to go back');
 }
 
+/** Day 5: named no-mic state — prices/positions keep working without it. */
+function showMicUnavailable() {
+  voice = { mode: 'error', message: 'mic unavailable' };
+  showScreen(
+    formatGlassesMicUnavailable(),
+    'Mic unavailable<br>No audio received — prices still live<br>Tap to go back',
+  );
+  setStatus('error', 'Mic unavailable — prices still live');
+}
+
 function showVoiceInfo(message: string) {
   voice = { mode: 'info', message };
   showScreen(formatGlassesVoiceError(message), escapeHtml(message));
@@ -257,6 +337,7 @@ function showVoiceInfo(message: string) {
 async function startListening() {
   if (voice.mode !== 'idle') return;
   const startedAt = Date.now();
+  micBytesReceived = 0;
   voice = { mode: 'listening', startedAt };
   const renderListening = () => {
     const elapsed = Math.floor((Date.now() - startedAt) / 1000);
@@ -273,14 +354,24 @@ async function startListening() {
       if (snap.finished) void handleTranscript(snap.finalText);
     },
     err => {
+      // Day 5: STT failure gets its own named screen — the raw upstream
+      // error stays in the console, the user gets a retry hint.
       console.warn('STT failed:', err);
-      showVoiceError(err instanceof Error ? err.message : 'Voice transcription failed');
+      showVoiceError("Couldn't hear that — try again");
     },
   );
   try {
     await bridge.audioControl(true);
   } catch (err) {
-    console.warn('audioControl(true) failed (mic may be unavailable in the simulator):', err);
+    // Day 5: the mic could not even be started (permission denied /
+    // unavailable) — named state, and the dangling STT client is dropped
+    // so its close() can never fire a phantom transcript later.
+    console.warn('audioControl(true) failed (mic unavailable):', err);
+    if (voice.mode === 'listening') {
+      clearVoiceTimers();
+      sttClient = null;
+      showMicUnavailable();
+    }
   }
 }
 
@@ -291,6 +382,12 @@ async function stopListening() {
   await stopMicQuietly();
   const client = sttClient;
   sttClient = null;
+  if (micBytesReceived === 0) {
+    // Day 5: the listen window heard nothing at all — the mic is denied
+    // or unavailable. Don't POST an empty buffer and blame STT for it.
+    showMicUnavailable();
+    return;
+  }
   voice = { mode: 'thinking', transcript: '' };
   showScreen('Heard…\nChecking…', 'Heard…<br>Checking…');
   client?.close();
@@ -463,7 +560,10 @@ const unsubscribe = bridge.onEvenHubEvent(event => {
 
   if (event.audioEvent?.audioPcm && voice.mode === 'listening' && sttClient) {
     const pcm = normalizePcm(event.audioEvent.audioPcm);
-    if (pcm) sttClient.sendPcm(pcm);
+    if (pcm) {
+      micBytesReceived += pcm.length;
+      sttClient.sendPcm(pcm);
+    }
     return;
   }
 
