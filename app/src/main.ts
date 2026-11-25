@@ -352,7 +352,10 @@ async function executeConfirmedOrder() {
       return;
     }
     voice = { mode: 'fill', fill: data.fill };
-    showScreen(formatGlassesFill(data.fill), formatGlassesFill(data.fill).replace(/\n/g, '<br>'));
+    // A close executes as a sell in the ledger — keep the CLOSE wording from
+    // the confirm screen so the fill doesn't read as a plain SELL.
+    const fillVerb = preview.side === 'close' ? 'CLOSE' : undefined;
+    showScreen(formatGlassesFill(data.fill, fillVerb), formatGlassesFill(data.fill, fillVerb).replace(/\n/g, '<br>'));
     setStatus('live', 'Order filled');
     voiceTimer = window.setTimeout(backToPrices, FILL_SHOW_MS);
   } catch (err) {
