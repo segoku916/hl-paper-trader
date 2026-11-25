@@ -235,9 +235,11 @@ export function formatGlassesConfirm(p: OrderPreviewView): string {
   return lines.join('\n');
 }
 
-/** Day 3 — fill confirmation for the G2 display. */
-export function formatGlassesFill(f: FillView): string {
-  const verb = f.side === 'buy' ? 'BUY' : 'SELL';
+/** Day 3 — fill confirmation for the G2 display. `verbOverride` lets a close
+ * order read FILLED CLOSE (the ledger executes a close as a sell, so the raw
+ * fill side is 'sell' — without the override the screen would say SELL). */
+export function formatGlassesFill(f: FillView, verbOverride?: string): string {
+  const verb = verbOverride ?? (f.side === 'buy' ? 'BUY' : 'SELL');
   const lines = [
     `FILLED ${verb} ${trimSize(f.size)} ${f.coin}`,
     `@ $${formatPrice(f.price)} · $${formatPrice(f.notional)}`,
