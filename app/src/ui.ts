@@ -51,7 +51,7 @@ export interface FillView {
 }
 
 /** Build stamp — bumped every build day so a stale build is visible in screenshots. */
-export const BUILD_STAMP = 'day4-telegram · 2026-11-25';
+export const BUILD_STAMP = 'day5-polish · 2026-11-26';
 
 type Status = 'connecting' | 'live' | 'error';
 
@@ -155,7 +155,7 @@ export function setPortfolio(p: PortfolioView) {
       <span>Realized <span class="${p.realizedPnl >= 0 ? 'chg-up' : 'chg-down'}">${formatSigned(p.realizedPnl)}</span></span>
     </div>`;
   if (p.positions.length === 0) {
-    positionsEl.innerHTML = `${head}<div class="pos-empty">No open positions</div>`;
+    positionsEl.innerHTML = `${head}<div class="pos-empty">No open positions — paper equity $${formatPrice(p.equity)}</div>`;
     return;
   }
   positionsEl.innerHTML =
@@ -255,6 +255,18 @@ export function formatGlassesVoiceError(message: string): string {
   return `${message}\nTap to go back`;
 }
 
+/** Day 5 — no-mic state: no audio arrived (mic denied/unavailable). Voice is
+ * down but prices + positions keep working — say so, never a blank screen. */
+export function formatGlassesMicUnavailable(): string {
+  return 'Mic unavailable\nNo audio received\nPrices still live\nTap to go back';
+}
+
+/** Day 5 — a fired price alert shown on the glasses (fire-once: main.ts
+ * tracks the newest alert id it has displayed and never re-shows one). */
+export function formatGlassesAlert(a: { coin: string; direction: string; price: number }): string {
+  return `ALERT: ${a.coin} ${a.direction} $${formatPrice(a.price)}\nTap to dismiss`;
+}
+
 /** Compact positions + PnL text for the G2 display (576x288 container). */
 export function formatGlassesPositions(p: PortfolioView): string {
   const lines = [
@@ -263,7 +275,7 @@ export function formatGlassesPositions(p: PortfolioView): string {
     `Cash $${formatPrice(p.cash)} · Realized ${formatSigned(p.realizedPnl)}`,
   ];
   if (p.positions.length === 0) {
-    lines.push('No open positions');
+    lines.push(`No open positions — paper equity $${formatPrice(p.equity)}`);
     return lines.join('\n');
   }
   for (const pos of p.positions) {
